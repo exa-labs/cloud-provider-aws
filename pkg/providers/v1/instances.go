@@ -90,6 +90,28 @@ func (name KubernetesInstanceID) MapToAWSInstanceID() (InstanceID, error) {
 	return InstanceID(awsID), nil
 }
 
+// AvailabilityZone extracts the availability zone from the KubernetesInstanceID.
+// Provider IDs of the form aws:///<zone>/<awsInstanceId> embed the AZ; for the
+// other forms (aws:////<awsInstanceId> or a bare <awsInstanceId>) no zone is
+// present and an empty string is returned.
+func (name KubernetesInstanceID) AvailabilityZone() string {
+	s := string(name)
+	if !strings.HasPrefix(s, "aws://") {
+		return ""
+	}
+	url, err := url.Parse(s)
+	if err != nil {
+		return ""
+	}
+	tokens := strings.Split(strings.Trim(url.Path, "/"), "/")
+	// Forms with a zone have it as the first path token followed by the
+	// instance ID (and possibly more tokens), e.g. <zone>/<awsInstanceId>.
+	if len(tokens) < 2 {
+		return ""
+	}
+	return tokens[0]
+}
+
 // mapToAWSInstanceID extracts the InstanceIDs from the Nodes, returning an error if a Node cannot be mapped
 func mapToAWSInstanceIDs(nodes []*v1.Node) ([]InstanceID, error) {
 	var instanceIDs []InstanceID

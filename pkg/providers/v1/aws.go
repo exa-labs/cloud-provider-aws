@@ -566,6 +566,37 @@ func azToRegion(az string) (string, error) {
 	return region, nil
 }
 
+// isForeignRegionNode reports whether the node identified by providerID lives in
+// an AWS region other than the one this cloud-controller-manager manages.
+//
+// A single CCM instance only has an EC2 client for its own region, so a
+// DescribeInstances call for an instance in another region returns
+// InvalidInstanceID.NotFound. Left unchecked, the node-lifecycle controller would
+// interpret that as a terminated instance and delete the otherwise-healthy node.
+// When multi-region support is enabled we detect these nodes from the availability
+// zone embedded in their providerID (aws:///<az>/<instance-id>) and leave them
+// untouched so each region's own controller (or external lifecycle management) owns
+// them.
+//
+// It returns false (i.e. treat the node as local) when multi-region support is
+// disabled or when the node's region cannot be determined, preserving the default
+// single-region behavior.
+func (c *Cloud) isForeignRegionNode(providerID string) bool {
+	if c.cfg == nil || !c.cfg.Global.MultiRegion {
+		return false
+	}
+	zone := KubernetesInstanceID(providerID).AvailabilityZone()
+	if zone == "" {
+		return false
+	}
+	region, err := azToRegion(zone)
+	if err != nil {
+		klog.Warningf("unable to derive region from providerID %q: %v", providerID, err)
+		return false
+	}
+	return region != c.region
+}
+
 func newAWSCloud(cfg config.CloudConfig, awsServices Services) (*Cloud, error) {
 	return newAWSCloud2(cfg, awsServices, nil, nil)
 }
@@ -888,6 +919,14 @@ func (c *Cloud) getInstanceNodeAddress(instance *ec2types.Instance) ([]v1.NodeAd
 // InstanceExistsByProviderID returns true if the instance with the given provider id still exists.
 // If false is returned with no error, the instance will be immediately deleted by the cloud controller manager.
 func (c *Cloud) InstanceExistsByProviderID(ctx context.Context, providerID string) (bool, error) {
+	// Nodes in another region are managed by that region's controller; this CCM
+	// has no EC2 client there and must not declare them gone (which would delete
+	// the node). Report them as existing.
+	if c.isForeignRegionNode(providerID) {
+		klog.V(4).Infof("InstanceExistsByProviderID: treating out-of-region node %q as existing", providerID)
+		return true, nil
+	}
+
 	instanceID, err := KubernetesInstanceID(providerID).MapToAWSInstanceID()
 	if err != nil {
 		return false, err
@@ -932,6 +971,13 @@ func (c *Cloud) InstanceExistsByProviderID(ctx context.Context, providerID strin
 
 // InstanceShutdownByProviderID returns true if the instance is terminated
 func (c *Cloud) InstanceShutdownByProviderID(ctx context.Context, providerID string) (bool, error) {
+	// Nodes in another region are managed by that region's controller; this CCM
+	// cannot inspect their instance state, so do not report them as shutdown.
+	if c.isForeignRegionNode(providerID) {
+		klog.V(4).Infof("InstanceShutdownByProviderID: treating out-of-region node %q as not shutdown", providerID)
+		return false, nil
+	}
+
 	instanceID, err := KubernetesInstanceID(providerID).MapToAWSInstanceID()
 	if err != nil {
 		return false, err

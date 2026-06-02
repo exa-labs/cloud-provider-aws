@@ -109,6 +109,21 @@ type CloudConfig struct {
 		// NLBSecurityGroupMode determines if the controller manages, creates, and attaches the security group when a service of type LoadBalancer (NLB) is created.
 		// Supported value is `Managed`.
 		NLBSecurityGroupMode string `json:"nlbSecurityGroupMode,omitempty" yaml:"nlbSecurityGroupMode,omitempty"`
+
+		// MultiRegion enables multi-region awareness for the node and node-lifecycle
+		// controllers. A cloud-controller-manager only has an EC2 client for its own
+		// region (Region above / the IMDS region), so DescribeInstances for an instance
+		// that lives in another region returns InvalidInstanceID.NotFound. Without this
+		// flag the node-lifecycle controller treats that as a terminated instance and
+		// deletes the otherwise-healthy node.
+		//
+		// When enabled, nodes whose region (derived from the availability zone embedded
+		// in their providerID, e.g. aws:///<az>/<instance-id>) differs from this
+		// controller's region are left untouched: they are reported as existing, not
+		// shutdown, and are not initialized. This lets nodes from other regions join the
+		// cluster (e.g. over VPC peering) and be managed by their own region's controller
+		// or by external lifecycle management.
+		MultiRegion bool `json:"multiRegion,omitempty" yaml:"multiRegion,omitempty"`
 	}
 	// [ServiceOverride "1"]
 	//  Service = s3

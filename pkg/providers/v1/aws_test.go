@@ -216,6 +216,37 @@ func TestReadAWSCloudConfigNodeIPFamilies(t *testing.T) {
 	}
 }
 
+func TestReadAWSCloudConfigMultiRegion(t *testing.T) {
+	tests := []struct {
+		name        string
+		reader      io.Reader
+		multiRegion bool
+	}{
+		{
+			"Defaults to false when unset",
+			strings.NewReader("[global]\n"),
+			false,
+		},
+		{
+			"Enabled via multiRegion",
+			strings.NewReader("[global]\nMultiRegion = true"),
+			true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := readAWSCloudConfig(test.reader)
+			if err != nil {
+				t.Fatalf("Should succeed for case %s: %v", test.name, err)
+			}
+			if cfg.Global.MultiRegion != test.multiRegion {
+				t.Errorf("MultiRegion = %v, want %v for case %s", cfg.Global.MultiRegion, test.multiRegion, test.name)
+			}
+		})
+	}
+}
+
 type ServiceDescriptor struct {
 	name                         string
 	region                       string

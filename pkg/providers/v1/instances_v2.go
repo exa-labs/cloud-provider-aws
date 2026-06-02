@@ -116,6 +116,13 @@ func (c *Cloud) getAdditionalLabels(ctx context.Context, zoneName string, instan
 // for a given node. In cases where node.spec.providerID is empty, implementations can use other
 // properties of the node like its name, labels and annotations.
 func (c *Cloud) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprovider.InstanceMetadata, error) {
+	// Nodes in another region must be initialized by that region's controller (or
+	// have self-initialized at registration); this CCM cannot describe their
+	// instance via its single-region EC2 client.
+	if node.Spec.ProviderID != "" && c.isForeignRegionNode(node.Spec.ProviderID) {
+		return nil, fmt.Errorf("node %s with providerID %s is in another region and is not managed by this controller (region %s)", node.Name, node.Spec.ProviderID, c.region)
+	}
+
 	providerID, err := c.getProviderID(ctx, node)
 	if err != nil {
 		return nil, err
