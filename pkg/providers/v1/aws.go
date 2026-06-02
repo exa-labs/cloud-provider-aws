@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -535,6 +536,12 @@ func init() {
 	})
 }
 
+// multiRegionEnvVar lets the multi-region behavior be toggled without a
+// cloud-config file. This is convenient for Helm-based deployments where the
+// chart exposes container env but does not mount an AWS cloud-config: setting
+// AWS_CCM_MULTI_REGION=true is equivalent to `[Global] MultiRegion = true`.
+const multiRegionEnvVar = "AWS_CCM_MULTI_REGION"
+
 // readAWSCloudConfig reads an instance of AWSCloudConfig from config reader.
 func readAWSCloudConfig(cloudConfig io.Reader) (*config.CloudConfig, error) {
 	var cfg config.CloudConfig
@@ -544,6 +551,19 @@ func readAWSCloudConfig(cloudConfig io.Reader) (*config.CloudConfig, error) {
 		err = gcfg.FatalOnly(gcfg.ReadInto(&cfg, cloudConfig))
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// An explicit env var can enable multi-region awareness on top of whatever
+	// the cloud-config (if any) specified. It can only turn the behavior on, so
+	// a cloud-config that already set MultiRegion = true is never overridden off.
+	if raw := os.Getenv(multiRegionEnvVar); raw != "" {
+		enabled, parseErr := strconv.ParseBool(raw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid %s value %q: %v", multiRegionEnvVar, raw, parseErr)
+		}
+		if enabled {
+			cfg.Global.MultiRegion = true
 		}
 	}
 

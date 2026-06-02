@@ -247,6 +247,79 @@ func TestReadAWSCloudConfigMultiRegion(t *testing.T) {
 	}
 }
 
+func TestReadAWSCloudConfigMultiRegionEnvVar(t *testing.T) {
+	tests := []struct {
+		name        string
+		reader      io.Reader
+		envValue    string
+		setEnv      bool
+		multiRegion bool
+		expectError bool
+	}{
+		{
+			name:        "Unset env keeps cloud-config default (false)",
+			reader:      strings.NewReader("[global]\n"),
+			multiRegion: false,
+		},
+		{
+			name:        "Env true enables without cloud-config file",
+			reader:      nil,
+			envValue:    "true",
+			setEnv:      true,
+			multiRegion: true,
+		},
+		{
+			name:        "Env true enables on top of cloud-config",
+			reader:      strings.NewReader("[global]\n"),
+			envValue:    "1",
+			setEnv:      true,
+			multiRegion: true,
+		},
+		{
+			name:        "Env false does not override cloud-config true",
+			reader:      strings.NewReader("[global]\nMultiRegion = true"),
+			envValue:    "false",
+			setEnv:      true,
+			multiRegion: true,
+		},
+		{
+			name:        "Env false leaves default off",
+			reader:      strings.NewReader("[global]\n"),
+			envValue:    "false",
+			setEnv:      true,
+			multiRegion: false,
+		},
+		{
+			name:        "Invalid env value errors",
+			reader:      strings.NewReader("[global]\n"),
+			envValue:    "yesplease",
+			setEnv:      true,
+			expectError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.setEnv {
+				t.Setenv(multiRegionEnvVar, test.envValue)
+			}
+			cfg, err := readAWSCloudConfig(test.reader)
+			if test.expectError {
+				if err == nil {
+					t.Fatalf("Should error for case %s (cfg=%v)", test.name, cfg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Should succeed for case %s: %v", test.name, err)
+			}
+			if cfg.Global.MultiRegion != test.multiRegion {
+				t.Errorf("MultiRegion = %v, want %v for case %s", cfg.Global.MultiRegion, test.multiRegion, test.name)
+			}
+		})
+	}
+}
+
 type ServiceDescriptor struct {
 	name                         string
 	region                       string

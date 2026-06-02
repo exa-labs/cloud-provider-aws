@@ -40,6 +40,22 @@ Nodes whose region matches the CCM's region (or whose region cannot be
 determined, e.g. a provider ID without an AZ) are handled exactly as before, so
 enabling the flag is safe for single-region clusters.
 
+### Enabling without a cloud-config file
+
+Some deployment paths (notably the Helm chart) expose container environment
+variables but do not mount an AWS cloud-config file. For those, set the
+`AWS_CCM_MULTI_REGION` environment variable instead:
+
+```yaml
+env:
+  - name: AWS_CCM_MULTI_REGION
+    value: "true"
+```
+
+The env var only ever turns the behavior **on**; a cloud config that already set
+`MultiRegion = true` is never overridden off. An unparseable value (anything
+`strconv.ParseBool` rejects) is treated as a fatal configuration error.
+
 ## Operating model
 
 `multiRegion` makes the CCM ignore nodes outside its region; it does not make a
