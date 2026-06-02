@@ -116,11 +116,9 @@ func (c *Cloud) getAdditionalLabels(ctx context.Context, zoneName string, instan
 // for a given node. In cases where node.spec.providerID is empty, implementations can use other
 // properties of the node like its name, labels and annotations.
 func (c *Cloud) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprovider.InstanceMetadata, error) {
-	// Nodes in another region must be initialized by that region's controller (or
-	// have self-initialized at registration); this CCM cannot describe their
-	// instance via its single-region EC2 client.
-	if node.Spec.ProviderID != "" && c.isForeignRegionNode(node.Spec.ProviderID) {
-		return nil, fmt.Errorf("node %s with providerID %s is in another region and is not managed by this controller (region %s)", node.Name, node.Spec.ProviderID, c.region)
+	// Nodes owned by another cloud provider are not ours to initialize.
+	if node.Spec.ProviderID != "" && providerIDIsForeignCloud(node.Spec.ProviderID) {
+		return nil, fmt.Errorf("node %s with providerID %s is managed by another cloud provider, not AWS", node.Name, node.Spec.ProviderID)
 	}
 
 	providerID, err := c.getProviderID(ctx, node)
@@ -131,6 +129,11 @@ func (c *Cloud) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprov
 	if err != nil {
 		return nil, fmt.Errorf("failed to map provider ID to AWS instance ID for node %s: %w", node.Name, err)
 	}
+
+	// With multi-region enabled the node may live in a region other than this
+	// CCM's home region; describe it through that region's own EC2 client.
+	region := c.regionForProviderID(providerID)
+	foreignRegion := c.isForeignRegion(region)
 
 	var (
 		instanceType  string
@@ -152,6 +155,22 @@ func (c *Cloud) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprov
 		if err != nil {
 			return nil, err
 		}
+	} else if foreignRegion {
+		clients, err := c.clientsForRegion(ctx, region)
+		if err != nil {
+			return nil, err
+		}
+		instance, err := describeInstance(ctx, clients.ec2, instanceID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get instance by ID %s in region %s: %w", instanceID, region, err)
+		}
+
+		instanceType = c.getInstanceType(instance)
+		zone = c.getInstanceZone(instance)
+		nodeAddresses, err = c.getInstanceNodeAddress(instance)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get node addresses for instance %s: %w", instanceID, err)
+		}
 	} else {
 		instance, err := c.getInstanceByID(ctx, string(instanceID))
 		if err != nil {
@@ -166,9 +185,17 @@ func (c *Cloud) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprov
 		}
 	}
 
-	additionalLabels, err := c.getAdditionalLabels(ctx, zone.FailureDomain, string(instanceID), instanceType, zone.Region, node.Labels)
-	if err != nil {
-		return nil, err
+	// The zone-ID and network-topology enrichment labels are resolved through
+	// the home-region zone cache and topology manager (DescribeAvailabilityZones
+	// / topology APIs are region-scoped), so they are only meaningful for
+	// home-region nodes. Foreign-region nodes get the core identity fields
+	// (provider ID, addresses, instance type, zone, region) without enrichment.
+	var additionalLabels map[string]string
+	if !foreignRegion {
+		additionalLabels, err = c.getAdditionalLabels(ctx, zone.FailureDomain, string(instanceID), instanceType, zone.Region, node.Labels)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &cloudprovider.InstanceMetadata{

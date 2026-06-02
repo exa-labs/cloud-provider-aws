@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -430,6 +431,26 @@ type Cloud struct {
 	createTagsBatcher       *createTagsBatcher
 	deleteTagsBatcher       *deleteTagsBatcher
 	describeInstanceBatcher *describeInstanceBatcher
+
+	// Multi-region support. When Global.MultiRegion is enabled the CCM manages
+	// nodes that live in AWS regions other than its own. It does so by building
+	// an EC2 client per foreign region on demand (using the same credential
+	// chain as the home-region client) and routing per-node EC2 calls through
+	// the client for the node's region. awsServices and assumeRoleProvider are
+	// retained from construction so these regional clients can be built lazily;
+	// regionalClients caches them keyed by region.
+	awsServices        Services
+	assumeRoleProvider *stscreds.AssumeRoleProvider
+	regionalClientsMu  sync.Mutex
+	regionalClients    map[string]*regionalEC2Clients
+}
+
+// regionalEC2Clients bundles the EC2 client (and its describe-instance batcher)
+// used to talk to a single AWS region. The home region reuses the Cloud's
+// primary ec2 client and batcher; foreign regions get their own, built lazily.
+type regionalEC2Clients struct {
+	ec2     iface.EC2
+	batcher *describeInstanceBatcher
 }
 
 // Interface to make the CloudConfig immutable for awsSDKProvider
@@ -586,35 +607,102 @@ func azToRegion(az string) (string, error) {
 	return region, nil
 }
 
-// isForeignRegionNode reports whether the node identified by providerID lives in
-// an AWS region other than the one this cloud-controller-manager manages.
+// providerIDIsForeignCloud reports whether providerID identifies a node managed
+// by a different cloud provider (e.g. "gce://...", "azure://...") rather than
+// AWS. AWS provider IDs use the "aws://" scheme; a bare instance ID with no
+// scheme is also treated as AWS for backwards compatibility (kubelet may set a
+// bare ID before the CCM normalizes it).
 //
-// A single CCM instance only has an EC2 client for its own region, so a
-// DescribeInstances call for an instance in another region returns
-// InvalidInstanceID.NotFound. Left unchecked, the node-lifecycle controller would
-// interpret that as a terminated instance and delete the otherwise-healthy node.
-// When multi-region support is enabled we detect these nodes from the availability
-// zone embedded in their providerID (aws:///<az>/<instance-id>) and leave them
-// untouched so each region's own controller (or external lifecycle management) owns
-// them.
-//
-// It returns false (i.e. treat the node as local) when multi-region support is
-// disabled or when the node's region cannot be determined, preserving the default
-// single-region behavior.
-func (c *Cloud) isForeignRegionNode(providerID string) bool {
-	if c.cfg == nil || !c.cfg.Global.MultiRegion {
+// The AWS provider ID parser otherwise coerces any unrecognized string into a
+// bare AWS instance ID (see KubernetesInstanceID.MapToAWSInstanceID), so without
+// this guard a foreign provider's node would be looked up in EC2, come back
+// NotFound, and be deleted by the node-lifecycle controller. Foreign-provider
+// nodes must be left entirely alone: this CCM neither initializes nor deletes
+// them, so that the provider that owns them can.
+func providerIDIsForeignCloud(providerID string) bool {
+	idx := strings.Index(providerID, "://")
+	if idx < 0 {
+		// No scheme: a bare instance ID, treated as AWS.
 		return false
 	}
+	return providerID[:idx] != "aws"
+}
+
+// regionForProviderID derives the AWS region a node lives in from the
+// availability zone embedded in its provider ID (aws:///<az>/<instance-id>).
+// It returns "" when the region cannot be determined (provider IDs of the form
+// aws:////<id> or a bare <id> carry no AZ), in which case callers fall back to
+// the home region — preserving single-region behavior.
+func (c *Cloud) regionForProviderID(providerID string) string {
 	zone := KubernetesInstanceID(providerID).AvailabilityZone()
 	if zone == "" {
-		return false
+		return ""
 	}
 	region, err := azToRegion(zone)
 	if err != nil {
 		klog.Warningf("unable to derive region from providerID %q: %v", providerID, err)
-		return false
+		return ""
 	}
-	return region != c.region
+	return region
+}
+
+// isForeignRegion reports whether region is an AWS region this CCM manages but
+// that is not its home region — i.e. multi-region support is enabled and region
+// is a determined, non-home region. Foreign-region nodes are managed through a
+// dedicated regional EC2 client (see clientsForRegion); when multi-region is
+// disabled every node is treated as home-region, preserving single-region
+// behavior.
+func (c *Cloud) isForeignRegion(region string) bool {
+	return region != "" && region != c.region && c.cfg != nil && c.cfg.Global.MultiRegion
+}
+
+// clientsForRegion returns the EC2 client and describe-instance batcher used to
+// talk to region. The home region (or any region when multi-region is disabled,
+// or an undeterminable region) reuses the Cloud's primary client. Foreign
+// regions get a dedicated client, built once via the same credential chain as
+// the home client and cached for reuse.
+//
+// IAM permissions are global, so the home client's credentials already authorize
+// EC2 calls in every region; clientsForRegion only needs to point a client at
+// the foreign region's endpoint. (Cross-account regions would additionally
+// require an assume-role provider, which is threaded through here unchanged.)
+func (c *Cloud) clientsForRegion(ctx context.Context, region string) (*regionalEC2Clients, error) {
+	home := &regionalEC2Clients{ec2: c.ec2, batcher: c.describeInstanceBatcher}
+	if !c.isForeignRegion(region) {
+		return home, nil
+	}
+	// awsServices is nil in some test constructions; fall back to the home
+	// client rather than failing.
+	if c.awsServices == nil {
+		return home, nil
+	}
+
+	c.regionalClientsMu.Lock()
+	defer c.regionalClientsMu.Unlock()
+	if c.regionalClients == nil {
+		c.regionalClients = map[string]*regionalEC2Clients{}
+	}
+	if existing, ok := c.regionalClients[region]; ok {
+		return existing, nil
+	}
+
+	ec2Client, err := c.awsServices.Compute(ctx, region, c.assumeRoleProvider)
+	if err != nil {
+		return nil, fmt.Errorf("error creating EC2 client for region %s: %v", region, err)
+	}
+	clients := &regionalEC2Clients{
+		ec2:     ec2Client,
+		batcher: newdescribeInstanceBatcher(ctx, ec2Client),
+	}
+	c.regionalClients[region] = clients
+	klog.V(2).Infof("multi-region: built EC2 client for region %s", region)
+	return clients, nil
+}
+
+// clientsForProviderID resolves the regional EC2 client for the node identified
+// by providerID, routing to the node's own region when multi-region is enabled.
+func (c *Cloud) clientsForProviderID(ctx context.Context, providerID string) (*regionalEC2Clients, error) {
+	return c.clientsForRegion(ctx, c.regionForProviderID(providerID))
 }
 
 func newAWSCloud(cfg config.CloudConfig, awsServices Services) (*Cloud, error) {
@@ -670,6 +758,8 @@ func newAWSCloud2(cfg config.CloudConfig, awsServices Services, provider config.
 		createTagsBatcher:       newCreateTagsBatcher(ctx, ec2),
 		deleteTagsBatcher:       newDeleteTagsBatcher(ctx, ec2),
 		describeInstanceBatcher: newdescribeInstanceBatcher(ctx, ec2),
+		awsServices:             awsServices,
+		assumeRoleProvider:      credentials,
 	}
 	awsCloud.instanceCache.cloud = awsCloud
 	awsCloud.zoneCache.cloud = awsCloud
@@ -939,11 +1029,10 @@ func (c *Cloud) getInstanceNodeAddress(instance *ec2types.Instance) ([]v1.NodeAd
 // InstanceExistsByProviderID returns true if the instance with the given provider id still exists.
 // If false is returned with no error, the instance will be immediately deleted by the cloud controller manager.
 func (c *Cloud) InstanceExistsByProviderID(ctx context.Context, providerID string) (bool, error) {
-	// Nodes in another region are managed by that region's controller; this CCM
-	// has no EC2 client there and must not declare them gone (which would delete
-	// the node). Report them as existing.
-	if c.isForeignRegionNode(providerID) {
-		klog.V(4).Infof("InstanceExistsByProviderID: treating out-of-region node %q as existing", providerID)
+	// Nodes owned by another cloud provider are not ours to manage; report them
+	// as existing so the node-lifecycle controller never deletes them.
+	if providerIDIsForeignCloud(providerID) {
+		klog.V(4).Infof("InstanceExistsByProviderID: treating non-AWS node %q as existing", providerID)
 		return true, nil
 	}
 
@@ -956,11 +1045,19 @@ func (c *Cloud) InstanceExistsByProviderID(ctx context.Context, providerID strin
 		return v.InstanceExists(ctx, string(instanceID), c.vpcID)
 	}
 
+	// Route the lookup through the EC2 client for the node's own region. With
+	// multi-region enabled this lets one CCM manage instances across regions;
+	// otherwise it resolves to the home-region client.
+	clients, err := c.clientsForProviderID(ctx, providerID)
+	if err != nil {
+		return false, err
+	}
+
 	request := &ec2.DescribeInstancesInput{
 		InstanceIds: []string{string(instanceID)},
 	}
 
-	instances, err := c.describeInstanceBatcher.DescribeInstances(ctx, request)
+	instances, err := clients.batcher.DescribeInstances(ctx, request)
 	if err != nil {
 		// if err is InstanceNotFound, return false with no error
 		if IsAWSErrorInstanceNotFound(err) {
@@ -991,10 +1088,10 @@ func (c *Cloud) InstanceExistsByProviderID(ctx context.Context, providerID strin
 
 // InstanceShutdownByProviderID returns true if the instance is terminated
 func (c *Cloud) InstanceShutdownByProviderID(ctx context.Context, providerID string) (bool, error) {
-	// Nodes in another region are managed by that region's controller; this CCM
-	// cannot inspect their instance state, so do not report them as shutdown.
-	if c.isForeignRegionNode(providerID) {
-		klog.V(4).Infof("InstanceShutdownByProviderID: treating out-of-region node %q as not shutdown", providerID)
+	// Nodes owned by another cloud provider are not ours to manage; never report
+	// them as shutdown.
+	if providerIDIsForeignCloud(providerID) {
+		klog.V(4).Infof("InstanceShutdownByProviderID: treating non-AWS node %q as not shutdown", providerID)
 		return false, nil
 	}
 
@@ -1007,11 +1104,18 @@ func (c *Cloud) InstanceShutdownByProviderID(ctx context.Context, providerID str
 		return v.InstanceShutdown(ctx, string(instanceID), c.vpcID)
 	}
 
+	// Route the lookup through the EC2 client for the node's own region (home
+	// region when multi-region is disabled).
+	clients, err := c.clientsForProviderID(ctx, providerID)
+	if err != nil {
+		return false, err
+	}
+
 	request := &ec2.DescribeInstancesInput{
 		InstanceIds: []string{string(instanceID)},
 	}
 
-	instances, err := c.describeInstanceBatcher.DescribeInstances(ctx, request)
+	instances, err := clients.batcher.DescribeInstances(ctx, request)
 	if err != nil {
 		return false, err
 	}
@@ -1118,10 +1222,19 @@ func (c *Cloud) GetZoneByProviderID(ctx context.Context, providerID string) (clo
 }
 
 func (c *Cloud) getInstanceZone(instance *ec2types.Instance) cloudprovider.Zone {
-	return cloudprovider.Zone{
-		FailureDomain: *(instance.Placement.AvailabilityZone),
-		Region:        c.region,
+	zone := cloudprovider.Zone{Region: c.region}
+	if instance.Placement == nil || instance.Placement.AvailabilityZone == nil {
+		return zone
 	}
+	az := *instance.Placement.AvailabilityZone
+	zone.FailureDomain = az
+	// Derive the region from the instance's own AZ rather than assuming the
+	// CCM's home region: with multi-region enabled the instance may live in a
+	// different region, and the region label must reflect where it actually is.
+	if region, err := azToRegion(az); err == nil {
+		zone.Region = region
+	}
+	return zone
 }
 
 // GetZoneByNodeName implements Zones.GetZoneByNodeName

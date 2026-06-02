@@ -30,87 +30,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/cloud-provider-aws/pkg/providers/v1/config"
 	"k8s.io/cloud-provider-aws/pkg/services"
 )
-
-func newMultiRegionCloud(region string, instanceExists bool, instanceState ec2types.InstanceStateName, instanceID string) *Cloud {
-	c := getCloudWithMockedDescribeInstances(instanceExists, instanceState, instanceID)
-	c.region = region
-	cfg := &config.CloudConfig{}
-	cfg.Global.MultiRegion = true
-	c.cfg = cfg
-	return c
-}
-
-func TestInstanceExistsMultiRegion(t *testing.T) {
-	for _, tc := range []struct {
-		name           string
-		multiRegion    bool
-		region         string
-		providerID     string
-		expectedExists bool
-	}{
-		{
-			name:           "out-of-region node is reported as existing without an EC2 lookup",
-			multiRegion:    true,
-			region:         "us-west-2",
-			providerID:     "aws:///us-east-1a/i-abc",
-			expectedExists: true,
-		},
-		{
-			name:           "in-region node falls through to the EC2 lookup",
-			multiRegion:    true,
-			region:         "us-west-2",
-			providerID:     "aws:///us-west-2a/i-abc",
-			expectedExists: false,
-		},
-		{
-			name:           "multi-region disabled keeps single-region behavior",
-			multiRegion:    false,
-			region:         "us-west-2",
-			providerID:     "aws:///us-east-1a/i-abc",
-			expectedExists: false,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// EC2 mock always returns InstanceNotFound, so a result of true can
-			// only come from the out-of-region short circuit.
-			c := newMultiRegionCloud(tc.region, false, "", "i-abc")
-			c.cfg.Global.MultiRegion = tc.multiRegion
-
-			result, err := c.InstanceExists(context.TODO(), &v1.Node{
-				Spec: v1.NodeSpec{ProviderID: tc.providerID},
-			})
-
-			assert.Nil(t, err)
-			assert.Equal(t, tc.expectedExists, result)
-		})
-	}
-}
-
-func TestInstanceShutdownMultiRegion(t *testing.T) {
-	// EC2 mock returns InstanceNotFound; an out-of-region node must still be
-	// reported as not shutdown so it is left untouched.
-	c := newMultiRegionCloud("us-west-2", false, "", "i-abc")
-
-	result, err := c.InstanceShutdown(context.TODO(), &v1.Node{
-		Spec: v1.NodeSpec{ProviderID: "aws:///us-east-1a/i-abc"},
-	})
-
-	assert.Nil(t, err)
-	assert.False(t, result)
-}
-
-func TestInstanceMetadataMultiRegion(t *testing.T) {
-	c := newMultiRegionCloud("us-west-2", false, "", "i-abc")
-
-	_, err := c.InstanceMetadata(context.TODO(), &v1.Node{
-		Spec: v1.NodeSpec{ProviderID: "aws:///us-east-1a/i-abc"},
-	})
-
-	assert.Error(t, err)
-}
 
 func TestGetProviderId(t *testing.T) {
 	for _, tc := range []struct {

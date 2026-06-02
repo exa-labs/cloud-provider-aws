@@ -19,8 +19,8 @@ control plane over VPC peering. For those out-of-region nodes:
 
 ## The `multiRegion` option
 
-Set `multiRegion = true` in the `[Global]` section of the cloud config to make
-the CCM region-aware:
+Set `multiRegion = true` in the `[Global]` section of the cloud config to let a
+single CCM actively manage nodes across multiple AWS regions:
 
 ```ini
 [Global]
@@ -28,17 +28,29 @@ MultiRegion = true
 ```
 
 When enabled, the CCM determines each node's region from the availability zone
-embedded in its provider ID (`aws:///<az>/<instance-id>`). Nodes whose region
-differs from the CCM's own region are left untouched:
+embedded in its provider ID (`aws:///<az>/<instance-id>`) and routes that node's
+EC2 calls through an EC2 client for the node's *own* region:
 
-* `InstanceExists` reports them as existing, so the node-lifecycle controller
-  does **not** delete them.
-* `InstanceShutdown` reports them as not shutdown.
-* `InstanceMetadata` does not attempt to initialize them.
+* It keeps using its home-region client for home-region nodes (so single-region
+  behavior is unchanged).
+* For a node in another region it lazily builds an EC2 client pointed at that
+  region's endpoint, caches it, and uses it for `InstanceExists`,
+  `InstanceShutdown`, and `InstanceMetadata`. The node is therefore fully
+  managed — addresses, instance type, `topology.kubernetes.io/{region,zone}`
+  labels, taint removal, and deletion on termination — by the correct region.
 
-Nodes whose region matches the CCM's region (or whose region cannot be
-determined, e.g. a provider ID without an AZ) are handled exactly as before, so
-enabling the flag is safe for single-region clusters.
+Nodes whose region cannot be determined (e.g. a provider ID without an AZ) fall
+back to the home-region client, so enabling the flag is safe for single-region
+clusters.
+
+### Regional enrichment labels
+
+Region-scoped enrichment that depends on home-region APIs — the zone-ID label
+(`DescribeAvailabilityZones`) and network-topology labels — is only applied to
+home-region nodes. Foreign-region nodes still receive the core identity fields
+(provider ID, addresses, instance type, and the region/zone topology labels
+derived from their AZ); they just skip the extra enrichment, which would
+otherwise be looked up against the wrong region.
 
 ### Enabling without a cloud-config file
 
@@ -56,21 +68,34 @@ The env var only ever turns the behavior **on**; a cloud config that already set
 `MultiRegion = true` is never overridden off. An unparseable value (anything
 `strconv.ParseBool` rejects) is treated as a fatal configuration error.
 
-## Operating model
+## Credentials and IAM
 
-`multiRegion` makes the CCM ignore nodes outside its region; it does not make a
-single CCM manage instances across regions. Out-of-region nodes must therefore
-get their identity and lifecycle from somewhere else:
+The CCM does **not** need a separate credential per region. AWS IAM is global:
+the role the CCM already runs under (e.g. an IRSA role with the standard CCM EC2
+permissions) is valid in every region, so the per-region clients all reuse the
+CCM's existing credential chain and simply target each region's EC2 endpoint.
+Make sure the role's permissions are not constrained to a single region (avoid
+region conditions in the policy) and that the regions are reachable from where
+the CCM runs.
 
-* **Initialization** — register the out-of-region nodes with their provider ID
-  and topology labels set at the kubelet level (e.g. `--provider-id` and
-  `--node-labels`) so they don't need the CCM to initialize them, or run a CCM
-  in that region that owns those nodes.
-* **Deletion on termination** — because this CCM no longer reaps out-of-region
-  nodes when their instances terminate, that responsibility moves to the
-  region's own CCM or to external lifecycle management (e.g. an ASG lifecycle
-  hook / termination handler, or AWS Node Termination Handler).
+The only case that needs additional credentials is when the regions live in
+**different AWS accounts**. The per-region client construction already threads an
+optional assume-role provider through, so cross-account support would be a matter
+of supplying a role to assume per account; same-account multi-region needs
+nothing beyond the existing role.
 
-This makes the standard "one CCM per region, each owning its region's nodes"
-topology safe: each CCM ignores the other regions' nodes instead of deleting
-them.
+## Nodes from other cloud providers
+
+A provider ID's scheme identifies the cloud that owns the node. Anything that is
+not the `aws://` scheme (for example `gce://…` or `azure://…`) belongs to a
+different provider, and the AWS CCM leaves it completely alone rather than trying
+to interpret it as an AWS instance:
+
+* `InstanceExists` reports it as existing, so the node-lifecycle controller never
+  deletes another provider's node.
+* `InstanceShutdown` reports it as not shutdown.
+* `InstanceMetadata` returns an error instead of initializing it.
+
+A bare instance ID with no scheme is still treated as AWS for backwards
+compatibility. This guard is independent of `multiRegion`: a non-AWS node is
+always left to its own provider.
