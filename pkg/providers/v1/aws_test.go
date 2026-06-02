@@ -3249,6 +3249,72 @@ func TestAzToRegion(t *testing.T) {
 	}
 }
 
+// TestIsForeignRegionNode exercises the guard that decides whether a node is
+// owned by another region's controller. The dangerous direction is a false
+// positive (treating a local node as foreign would stop us from initializing or
+// reaping it), so the guard must only ever return true when multi-region is on
+// AND the providerID unambiguously resolves to a different region. Everything
+// else — multi-region off, no config, an AZ-less/custom providerID, or an AZ we
+// cannot parse — must fall back to the default single-region behavior (false).
+func TestIsForeignRegionNode(t *testing.T) {
+	const ccmRegion = "us-west-2"
+	for _, tc := range []struct {
+		name        string
+		multiRegion bool
+		nilConfig   bool
+		providerID  string
+		expected    bool
+	}{
+		{
+			name:        "out-of-region node with multi-region on is foreign",
+			multiRegion: true,
+			providerID:  "aws:///us-east-1a/i-abc",
+			expected:    true,
+		},
+		{
+			name:        "in-region node is local",
+			multiRegion: true,
+			providerID:  "aws:///us-west-2a/i-abc",
+			expected:    false,
+		},
+		{
+			name:        "out-of-region node is local when multi-region is disabled",
+			multiRegion: false,
+			providerID:  "aws:///us-east-1a/i-abc",
+			expected:    false,
+		},
+		{
+			name:       "nil config is local",
+			nilConfig:  true,
+			providerID: "aws:///us-east-1a/i-abc",
+			expected:   false,
+		},
+		{
+			name:        "providerID without an AZ is local (region undeterminable)",
+			multiRegion: true,
+			providerID:  "aws:////i-abc",
+			expected:    false,
+		},
+		{
+			name:        "providerID with an unparseable AZ is local",
+			multiRegion: true,
+			providerID:  "aws:///0/i-abc",
+			expected:    false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Cloud{region: ccmRegion}
+			if !tc.nilConfig {
+				cfg := &config.CloudConfig{}
+				cfg.Global.MultiRegion = tc.multiRegion
+				c.cfg = cfg
+			}
+
+			assert.Equal(t, tc.expected, c.isForeignRegionNode(tc.providerID))
+		})
+	}
+}
+
 func TestCloud_sortELBSecurityGroupList(t *testing.T) {
 	type args struct {
 		securityGroupIDs       []string
