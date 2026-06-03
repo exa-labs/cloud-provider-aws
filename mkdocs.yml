@@ -13,6 +13,7 @@ nav:
     - credential_provider.md
     - getting_started.md
     - nlb_security_groups.md
+    - 'Multi-region nodes': multi_region.md
   - 'Development':
     - 'Running the Cloud Provider': development.md
     - 'Release Process': RELEASE.md

@@ -216,6 +216,110 @@ func TestReadAWSCloudConfigNodeIPFamilies(t *testing.T) {
 	}
 }
 
+func TestReadAWSCloudConfigMultiRegion(t *testing.T) {
+	tests := []struct {
+		name        string
+		reader      io.Reader
+		multiRegion bool
+	}{
+		{
+			"Defaults to false when unset",
+			strings.NewReader("[global]\n"),
+			false,
+		},
+		{
+			"Enabled via multiRegion",
+			strings.NewReader("[global]\nMultiRegion = true"),
+			true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := readAWSCloudConfig(test.reader)
+			if err != nil {
+				t.Fatalf("Should succeed for case %s: %v", test.name, err)
+			}
+			if cfg.Global.MultiRegion != test.multiRegion {
+				t.Errorf("MultiRegion = %v, want %v for case %s", cfg.Global.MultiRegion, test.multiRegion, test.name)
+			}
+		})
+	}
+}
+
+func TestReadAWSCloudConfigMultiRegionEnvVar(t *testing.T) {
+	tests := []struct {
+		name        string
+		reader      io.Reader
+		envValue    string
+		setEnv      bool
+		multiRegion bool
+		expectError bool
+	}{
+		{
+			name:        "Unset env keeps cloud-config default (false)",
+			reader:      strings.NewReader("[global]\n"),
+			multiRegion: false,
+		},
+		{
+			name:        "Env true enables without cloud-config file",
+			reader:      nil,
+			envValue:    "true",
+			setEnv:      true,
+			multiRegion: true,
+		},
+		{
+			name:        "Env true enables on top of cloud-config",
+			reader:      strings.NewReader("[global]\n"),
+			envValue:    "1",
+			setEnv:      true,
+			multiRegion: true,
+		},
+		{
+			name:        "Env false does not override cloud-config true",
+			reader:      strings.NewReader("[global]\nMultiRegion = true"),
+			envValue:    "false",
+			setEnv:      true,
+			multiRegion: true,
+		},
+		{
+			name:        "Env false leaves default off",
+			reader:      strings.NewReader("[global]\n"),
+			envValue:    "false",
+			setEnv:      true,
+			multiRegion: false,
+		},
+		{
+			name:        "Invalid env value errors",
+			reader:      strings.NewReader("[global]\n"),
+			envValue:    "yesplease",
+			setEnv:      true,
+			expectError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.setEnv {
+				t.Setenv(multiRegionEnvVar, test.envValue)
+			}
+			cfg, err := readAWSCloudConfig(test.reader)
+			if test.expectError {
+				if err == nil {
+					t.Fatalf("Should error for case %s (cfg=%v)", test.name, cfg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Should succeed for case %s: %v", test.name, err)
+			}
+			if cfg.Global.MultiRegion != test.multiRegion {
+				t.Errorf("MultiRegion = %v, want %v for case %s", cfg.Global.MultiRegion, test.multiRegion, test.name)
+			}
+		})
+	}
+}
+
 type ServiceDescriptor struct {
 	name                         string
 	region                       string
@@ -3143,6 +3247,206 @@ func TestAzToRegion(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, testCase.region, result)
 	}
+}
+
+// TestProviderIDIsForeignCloud exercises the guard that decides whether a node
+// belongs to a different cloud provider. The dangerous direction is a false
+// negative (treating a non-AWS node as AWS would coerce it into a bogus instance
+// ID and let the lifecycle controller delete it), so anything with a non-"aws"
+// scheme must be reported foreign while bare/AWS IDs stay AWS.
+func TestProviderIDIsForeignCloud(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		providerID string
+		expected   bool
+	}{
+		{name: "aws scheme is not foreign", providerID: "aws:///us-west-2a/i-abc", expected: false},
+		{name: "aws scheme without az is not foreign", providerID: "aws:////i-abc", expected: false},
+		{name: "bare instance id is not foreign", providerID: "i-abc", expected: false},
+		{name: "empty is not foreign", providerID: "", expected: false},
+		{name: "gce scheme is foreign", providerID: "gce://project/us-central1-a/instance", expected: true},
+		{name: "azure scheme is foreign", providerID: "azure:///subscriptions/x/vm", expected: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, providerIDIsForeignCloud(tc.providerID))
+		})
+	}
+}
+
+func TestIsForeignRegion(t *testing.T) {
+	const ccmRegion = "us-west-2"
+	for _, tc := range []struct {
+		name        string
+		multiRegion bool
+		nilConfig   bool
+		providerID  string
+		expected    bool
+	}{
+		{
+			name:        "out-of-region node with multi-region on is foreign",
+			multiRegion: true,
+			providerID:  "aws:///us-east-1a/i-abc",
+			expected:    true,
+		},
+		{
+			name:        "in-region node is local",
+			multiRegion: true,
+			providerID:  "aws:///us-west-2a/i-abc",
+			expected:    false,
+		},
+		{
+			name:        "out-of-region node is local when multi-region is disabled",
+			multiRegion: false,
+			providerID:  "aws:///us-east-1a/i-abc",
+			expected:    false,
+		},
+		{
+			name:       "nil config is local",
+			nilConfig:  true,
+			providerID: "aws:///us-east-1a/i-abc",
+			expected:   false,
+		},
+		{
+			name:        "providerID without an AZ is local (region undeterminable)",
+			multiRegion: true,
+			providerID:  "aws:////i-abc",
+			expected:    false,
+		},
+		{
+			name:        "providerID with an unparseable AZ is local",
+			multiRegion: true,
+			providerID:  "aws:///0/i-abc",
+			expected:    false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Cloud{region: ccmRegion}
+			if !tc.nilConfig {
+				cfg := &config.CloudConfig{}
+				cfg.Global.MultiRegion = tc.multiRegion
+				c.cfg = cfg
+			}
+
+			assert.Equal(t, tc.expected, c.isForeignRegion(c.regionForProviderID(tc.providerID)))
+		})
+	}
+}
+
+// newMultiRegionTestCloud builds a CCM whose home region is us-west-2 with
+// multi-region enabled, registers homeInstances in the home region and
+// foreignInstances under their respective regions, and returns the cloud plus
+// the fake services (to assert which regions Compute was asked for).
+func newMultiRegionTestCloud(t *testing.T, multiRegion bool, homeInstances []*ec2types.Instance, foreignInstances map[string][]*ec2types.Instance) (*Cloud, *FakeAWSServices) {
+	t.Helper()
+	awsServices := newMockedFakeAWSServices(TestClusterID)
+	if homeInstances != nil {
+		awsServices.instances = homeInstances
+	}
+	awsServices.regionalInstances = foreignInstances
+	cfg := config.CloudConfig{}
+	cfg.Global.MultiRegion = multiRegion
+	c, err := newAWSCloud(cfg, awsServices)
+	if err != nil {
+		t.Fatalf("error building test cloud: %v", err)
+	}
+	return c, awsServices
+}
+
+func makeRegionalInstance(instanceID, az, privateIP string) *ec2types.Instance {
+	inst := makeInstance(instanceID, privateIP, "", "ip-"+instanceID, "", nil, false)
+	inst.Placement = &ec2types.Placement{AvailabilityZone: aws.String(az)}
+	return &inst
+}
+
+func TestInstanceExistsByProviderIDMultiRegion(t *testing.T) {
+	foreign := makeRegionalInstance("i-east", "us-east-1a", "10.0.0.5")
+
+	t.Run("foreign-region node is found via its regional client", func(t *testing.T) {
+		c, services := newMultiRegionTestCloud(t, true, nil,
+			map[string][]*ec2types.Instance{"us-east-1": {foreign}})
+		exists, err := c.InstanceExistsByProviderID(context.TODO(), "aws:///us-east-1a/i-east")
+		assert.NoError(t, err)
+		assert.True(t, exists)
+		assert.Contains(t, services.computeRegions, "us-east-1")
+	})
+
+	t.Run("terminated foreign-region node reports not-exists", func(t *testing.T) {
+		c, _ := newMultiRegionTestCloud(t, true, nil,
+			map[string][]*ec2types.Instance{"us-east-1": {}})
+		exists, err := c.InstanceExistsByProviderID(context.TODO(), "aws:///us-east-1a/i-gone")
+		assert.NoError(t, err)
+		assert.False(t, exists)
+	})
+
+	t.Run("foreign cloud provider node is left alone (reported existing)", func(t *testing.T) {
+		c, services := newMultiRegionTestCloud(t, true, nil, nil)
+		exists, err := c.InstanceExistsByProviderID(context.TODO(), "gce://project/us-central1-a/inst")
+		assert.NoError(t, err)
+		assert.True(t, exists)
+		// No EC2 client should have been built for a foreign cloud.
+		assert.NotContains(t, services.computeRegions, "us-central1")
+	})
+
+	t.Run("multi-region disabled keeps single-region behavior", func(t *testing.T) {
+		// With multi-region off, an out-of-region node is looked up in the home
+		// client (which doesn't have it) and reported not-exists, as before.
+		c, services := newMultiRegionTestCloud(t, false, nil,
+			map[string][]*ec2types.Instance{"us-east-1": {foreign}})
+		exists, err := c.InstanceExistsByProviderID(context.TODO(), "aws:///us-east-1a/i-east")
+		assert.NoError(t, err)
+		assert.False(t, exists)
+		assert.NotContains(t, services.computeRegions, "us-east-1")
+	})
+}
+
+func TestInstanceShutdownByProviderIDMultiRegion(t *testing.T) {
+	running := makeRegionalInstance("i-east", "us-east-1a", "10.0.0.5")
+
+	t.Run("running foreign-region node is not shutdown", func(t *testing.T) {
+		c, services := newMultiRegionTestCloud(t, true, nil,
+			map[string][]*ec2types.Instance{"us-east-1": {running}})
+		down, err := c.InstanceShutdownByProviderID(context.TODO(), "aws:///us-east-1a/i-east")
+		assert.NoError(t, err)
+		assert.False(t, down)
+		assert.Contains(t, services.computeRegions, "us-east-1")
+	})
+
+	t.Run("foreign cloud provider node is not shutdown without an EC2 call", func(t *testing.T) {
+		c, services := newMultiRegionTestCloud(t, true, nil, nil)
+		down, err := c.InstanceShutdownByProviderID(context.TODO(), "azure:///subscriptions/x/vm")
+		assert.NoError(t, err)
+		assert.False(t, down)
+		assert.NotContains(t, services.computeRegions, "azure")
+	})
+}
+
+func TestInstanceMetadataMultiRegion(t *testing.T) {
+	foreign := makeRegionalInstance("i-east", "us-east-1a", "10.0.0.5")
+
+	t.Run("foreign-region node initialized via its regional client", func(t *testing.T) {
+		c, services := newMultiRegionTestCloud(t, true, nil,
+			map[string][]*ec2types.Instance{"us-east-1": {foreign}})
+		node := &v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-east"},
+			Spec:       v1.NodeSpec{ProviderID: "aws:///us-east-1a/i-east"},
+		}
+		md, err := c.InstanceMetadata(context.TODO(), node)
+		assert.NoError(t, err)
+		assert.Equal(t, "aws:///us-east-1a/i-east", md.ProviderID)
+		assert.Equal(t, "us-east-1", md.Region)
+		assert.Equal(t, "us-east-1a", md.Zone)
+		assert.Contains(t, services.computeRegions, "us-east-1")
+	})
+
+	t.Run("foreign cloud provider node is not initialized", func(t *testing.T) {
+		c, _ := newMultiRegionTestCloud(t, true, nil, nil)
+		node := &v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-gce"},
+			Spec:       v1.NodeSpec{ProviderID: "gce://project/us-central1-a/inst"},
+		}
+		_, err := c.InstanceMetadata(context.TODO(), node)
+		assert.Error(t, err)
+	})
 }
 
 func TestCloud_sortELBSecurityGroupList(t *testing.T) {

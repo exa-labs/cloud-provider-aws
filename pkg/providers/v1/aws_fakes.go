@@ -57,6 +57,15 @@ type FakeAWSServices struct {
 	metadata *FakeMetadata
 	kms      *FakeKMS
 
+	// regionalInstances holds instance sets keyed by AWS region, describing
+	// instances that live outside the home region. Compute(region) hands back a
+	// FakeEC2Impl scoped to regionalInstances[region], so multi-region tests can
+	// verify per-region client routing. computeRegions records every region
+	// Compute was asked for.
+	regionalInstances map[string][]*ec2types.Instance
+	computeRegions    []string
+	homeComputeRegion string
+
 	callCounts map[string]int
 }
 
@@ -157,9 +166,20 @@ func (s *FakeAWSServices) countCall(service string, api string, resourceID strin
 	return count
 }
 
-// Compute returns a fake EC2 client
+// Compute returns a fake EC2 client. The first region requested (the CCM's home
+// region, established during construction) and any later request for that same
+// region get the shared home client backed by s.instances; any other region gets
+// a region-scoped client backed by s.regionalInstances[region], so tests can
+// assert that foreign-region nodes are routed through a per-region client.
 func (s *FakeAWSServices) Compute(ctx context.Context, region string, assumeRoleProvider *stscredsv2.AssumeRoleProvider) (iface.EC2, error) {
-	return s.ec2, nil
+	s.computeRegions = append(s.computeRegions, region)
+	if s.homeComputeRegion == "" {
+		s.homeComputeRegion = region
+	}
+	if region == "" || region == s.homeComputeRegion {
+		return s.ec2, nil
+	}
+	return &FakeEC2Impl{aws: s, region: region}, nil
 }
 
 // LoadBalancing returns a fake ELB client
@@ -198,13 +218,28 @@ type FakeEC2Impl struct {
 	DescribeSubnetsInput     *ec2.DescribeSubnetsInput
 	RouteTables              []ec2types.RouteTable
 	DescribeRouteTablesInput *ec2.DescribeRouteTablesInput
+	// region scopes which instance set this client sees. The home client
+	// (region == "") sees aws.instances; a regional client (built by Compute for
+	// a non-home region) sees aws.regionalInstances[region]. This lets tests
+	// assert that a per-region EC2 client is actually used for foreign-region
+	// nodes rather than the home-region client.
+	region string
+}
+
+// sourceInstances returns the instance set this fake client describes, scoped to
+// its region (see FakeEC2Impl.region).
+func (ec2i *FakeEC2Impl) sourceInstances() []*ec2types.Instance {
+	if ec2i.region == "" {
+		return ec2i.aws.instances
+	}
+	return ec2i.aws.regionalInstances[ec2i.region]
 }
 
 // DescribeInstances returns fake instance descriptions
 func (ec2i *FakeEC2Impl) DescribeInstances(ctx context.Context, request *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) ([]ec2types.Instance, error) {
 	matches := []ec2types.Instance{}
 	var matchedInstances []string
-	for _, instance := range ec2i.aws.instances {
+	for _, instance := range ec2i.sourceInstances() {
 		if request.InstanceIds != nil {
 			if instance.InstanceId == nil {
 				klog.Warning("Instance with no instance id: ", instance)

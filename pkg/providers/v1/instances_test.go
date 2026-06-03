@@ -26,6 +26,25 @@ import (
 	v1 "k8s.io/api/core/v1"
 )
 
+func TestKubernetesInstanceIDAvailabilityZone(t *testing.T) {
+	tests := []struct {
+		Kubernetes KubernetesInstanceID
+		Zone       string
+	}{
+		{Kubernetes: "aws:///us-east-1a/i-12345678", Zone: "us-east-1a"},
+		{Kubernetes: "aws:///us-west-2c/1abc-2def/i-abc", Zone: "us-west-2c"},
+		{Kubernetes: "aws:////i-12345678", Zone: ""},
+		{Kubernetes: "i-12345678", Zone: ""},
+		{Kubernetes: "", Zone: ""},
+	}
+
+	for _, test := range tests {
+		if got := test.Kubernetes.AvailabilityZone(); got != test.Zone {
+			t.Errorf("AvailabilityZone(%q) = %q, want %q", test.Kubernetes, got, test.Zone)
+		}
+	}
+}
+
 func TestMapToAWSInstanceIDs(t *testing.T) {
 	tests := []struct {
 		Kubernetes  KubernetesInstanceID
